@@ -2,6 +2,56 @@
 
 **Author:** Pavel Davydov (ferz)
 
+## [1.1.0.0] - 2026-05-29
+- **Dynamic Server List (GetServers RPC)**
+  - Servers loaded from `ServerService.GetServers()` (public, no auth)
+  - Fallback to hardcoded servers if RPC fails
+  - Server selector on both login and registration forms
+  - Default server highlighted and sorted first
+- **Registration Flow**
+  - Auto-login after successful registration
+  - Password confirmation field
+  - Email field (optional)
+  - Handles `REGISTRATION_SUCCESS`, `USER_ALREADY_EXISTS`, `EMAIL_ALREADY_IN_USE`
+- **Chat Text Copy**
+  - Copy button (📋) in toolbar copies all chat text to clipboard
+- **Stability Fixes**
+  - Fixed crash on nil `CreatedAt` in SYSTEM messages
+  - Fixed crash when server unavailable at startup
+  - Fixed race condition with global `loginForm` variable
+  - Fixed `GetAllUsersResponse.Users` type (`[]*UserInfo` vs `string`)
+  - Removed `//go:build ignore` constraint
+  - Removed default credentials from config
+- **Proto Updates**
+  - Added `server.pb.go` and `server_grpc.pb.go` (ServerService)
+  - Updated `messenger.pb.go` and `messenger_grpc.pb.go`
+- **Architecture**
+  - Global variables: `currentUsername`, `currentPassword`, `currentConn`
+  - `serverList []ServerEntry` populated by `fetchServers()`
+  - All proto files synced from server repo
+
+## [1.0.1.27] - 2026-04-20
+- **Registration Support**
+  - Added "Нет аккаунта? Зарегистрироваться" button in login dialog
+  - Registration form with username, password, confirm password, email fields
+  - Server selector on registration form (new/old server)
+  - Sends `Register: true` flag to server for new user creation
+  - Handles `REGISTRATION_SUCCESS`, `USER_ALREADY_EXISTS`, `EMAIL_ALREADY_IN_USE` responses
+- **Server Selector on Login**
+  - Added server dropdown on login form
+  - Pre-configured servers: `13.140.25.249:50051` (new) and `159.195.38.145:50051` (old)
+  - Selected server persists during session
+- **Stability Fixes**
+  - Fixed crash when server unavailable (login form always shown)
+  - Fixed crash on nil `CreatedAt` timestamp in SYSTEM messages
+  - Added SYSTEM message filtering (SERVER_INFO, auth messages etc.)
+  - Added nil-check for `CreatedAt` before calling `AsTime()`
+  - Removed default login credentials (empty fields by default)
+- **Proto Compatibility**
+  - Fixed `GetAllUsersResponse.Users` type change (`[]*UserInfo` vs `[]string`)
+  - Updated `showUsersList` to use `userInfo.Username`
+  - Removed `//go:build ignore` constraint
+
 ## [1.0.1.27] - 2026-04-20
 - **Chat Message Avatar Display**
   - Added avatar emoji (👤) display in chat messages next to username

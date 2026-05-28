@@ -1,5 +1,3 @@
-//go:build ignore
-
 // Lavender Messenger - A secure messaging application
 // Author: Pavel Davydov (ferz)
 //
@@ -34,13 +32,70 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const clientVersion = "1.0.1.27"
+const clientVersion = "1.1.0.0"
 
 var myWindow fyne.Window
 var chatBox *widget.RichText
 var connectToServer func(string)
 var avatarCache = make(map[string]string) // Cache for avatar URLs
 var avatarCacheMutex sync.Mutex           // Mutex for thread-safe avatarCache access
+var loginForm *dialog.ConfirmDialog       // Global reference to login form for re-showing after registration
+var globalCfg *Config                     // Global config reference for registration
+var currentUsername string                // Current logged-in username
+var currentPassword string                // Current logged-in password
+var currentConn *grpc.ClientConn          // Current gRPC connection
+
+// Server list from GetServers RPC
+type ServerEntry struct {
+	Name    string
+	Address string
+}
+var serverList []ServerEntry // Populated by fetchServers
+
+// fetchServers loads server list from GetServers RPC
+func fetchServers(defaultAddr string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := grpc.NewClient(defaultAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		// Fallback to default servers if RPC fails
+		serverList = []ServerEntry{
+			{Name: "Новый", Address: "13.140.25.249:50051"},
+			{Name: "Старый", Address: "159.195.38.145:50051"},
+		}
+		return
+	}
+	defer conn.Close()
+
+	client := gen.NewServerServiceClient(conn)
+	resp, err := client.GetServers(ctx, &gen.GetServersRequest{})
+	if err != nil || len(resp.Servers) == 0 {
+		// Fallback
+		serverList = []ServerEntry{
+			{Name: "Новый", Address: "13.140.25.249:50051"},
+			{Name: "Старый", Address: "159.195.38.145:50051"},
+		}
+		return
+	}
+
+	var servers []ServerEntry
+	for _, s := range resp.Servers {
+		addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
+		name := s.Name
+		if name == "" {
+			name = addr
+		}
+		if s.IsDefault {
+			name = name + " (default)"
+			// Put default first
+			servers = append([]ServerEntry{{Name: name, Address: addr}}, servers...)
+		} else {
+			servers = append(servers, ServerEntry{Name: name, Address: addr})
+		}
+	}
+	serverList = servers
+}
 
 func getConfigPaths() []string {
 	var paths []string
@@ -67,6 +122,7 @@ type Config struct {
 	CurrentTheme string `yaml:"current_theme"`
 	LastUsername string `yaml:"last_username"`
 	LastPassword string `yaml:"last_password"`
+	LastEmail    string `yaml:"last_email"`
 }
 
 type ThemeConfig struct {
@@ -420,17 +476,18 @@ func showUsersList(client gen.ChatServiceClient, currentUsername string) {
 	usersList := container.NewVBox()
 	userCount := 0
 
-	for _, user := range allUsersResp.Users {
-		if user == currentUsername {
+	for _, userInfo := range allUsersResp.Users {
+		username := userInfo.Username
+		if username == currentUsername {
 			continue // Skip current user
 		}
 
-		userLabel := widget.NewLabel(user)
+		userLabel := widget.NewLabel(username)
 		userLabel.TextStyle = fyne.TextStyle{Bold: true}
 
 		// Create green circle indicator for online users
 		var statusIndicator fyne.CanvasObject
-		if onlineUsersSet[user] {
+		if onlineUsersSet[username] {
 			statusIndicator = canvas.NewCircle(color.RGBA{R: 0, G: 255, B: 0, A: 255}) // Green
 			statusIndicator.Resize(fyne.NewSize(12, 12))
 		} else {
@@ -440,7 +497,7 @@ func showUsersList(client gen.ChatServiceClient, currentUsername string) {
 
 		btn := widget.NewButton("", func() {
 			// Create direct chat with selected user
-			createDirectChat(client, currentUsername, user)
+			createDirectChat(client, currentUsername, username)
 		})
 		btn.Importance = widget.LowImportance
 
@@ -509,17 +566,207 @@ func checkServerAvailability(addr string) error {
 	return nil
 }
 
+// showRegisterDialog показывает форму регистрации с выбором сервера
+func showRegisterDialog(currentServer string) {
+	regUsernameEntry := widget.NewEntry()
+	regUsernameEntry.SetPlaceHolder("Имя пользователя")
+
+	regPasswordEntry := widget.NewPasswordEntry()
+	regPasswordEntry.SetPlaceHolder("Пароль")
+
+	regConfirmPasswordEntry := widget.NewPasswordEntry()
+	regConfirmPasswordEntry.SetPlaceHolder("Подтвердите пароль")
+
+	regEmailEntry := widget.NewEntry()
+	regEmailEntry.SetPlaceHolder("Email (необязательно)")
+
+	// Server selector — use global serverList
+	if len(serverList) == 0 {
+		serverList = []ServerEntry{
+			{Name: "Новый", Address: "13.140.25.249:50051"},
+			{Name: "Старый", Address: "159.195.38.145:50051"},
+		}
+	}
+	regServerNames := make([]string, len(serverList))
+	regServerAddrs := make([]string, len(serverList))
+	for i, s := range serverList {
+		regServerNames[i] = s.Name
+		regServerAddrs[i] = s.Address
+	}
+
+	serverLabel := widget.NewLabel("Сервер:")
+	serverSelect := widget.NewSelect(regServerNames, func(s string) {})
+	// Pre-select current server
+	found := false
+	for i, addr := range regServerAddrs {
+		if addr == currentServer {
+			serverSelect.SetSelected(regServerNames[i])
+			found = true
+			break
+		}
+	}
+	if !found && len(regServerNames) > 0 {
+		serverSelect.SetSelected(regServerNames[0])
+	}
+
+	registerForm := dialog.NewCustomConfirm("Регистрация", "Зарегистрироваться", "Отмена",
+		container.NewVBox(
+			widget.NewLabel("Имя пользователя:"),
+			regUsernameEntry,
+			widget.NewLabel("Пароль:"),
+			regPasswordEntry,
+			widget.NewLabel("Подтвердите пароль:"),
+			regConfirmPasswordEntry,
+			widget.NewLabel("Email:"),
+			regEmailEntry,
+			serverLabel,
+			serverSelect,
+		),
+		func(b bool) {
+			if b && regUsernameEntry.Text != "" {
+				u := regUsernameEntry.Text
+				p := regPasswordEntry.Text
+				confirmP := regConfirmPasswordEntry.Text
+				email := regEmailEntry.Text
+				// Find address from selected name
+				selectedServer := regServerAddrs[0]
+				for i, name := range regServerNames {
+					if name == serverSelect.Selected {
+						selectedServer = regServerAddrs[i]
+						break
+					}
+				}
+
+				if p == "" {
+					dialog.ShowError(errors.New("Введите пароль"), myWindow)
+					return
+				}
+				if p != confirmP {
+					dialog.ShowError(errors.New("Пароли не совпадают"), myWindow)
+					return
+				}
+
+				// Connect to selected server
+				regConn, err := grpc.NewClient(selectedServer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("Не удалось подключиться к %s: %v", selectedServer, err), myWindow)
+					return
+				}
+
+				regCtx, regCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				regClient := gen.NewChatServiceClient(regConn)
+				regStream, err := regClient.Chat(regCtx)
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("Ошибка соединения с %s: %v", selectedServer, err), myWindow)
+					regConn.Close()
+					regCancel()
+					return
+				}
+
+				// Send registration message with Register=true
+				err = regStream.Send(&gen.Message{
+					User:     u,
+					Password: p,
+					Register: true,
+					Text:     email,
+				})
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("Ошибка отправки: %v", err), myWindow)
+					regConn.Close()
+					regCancel()
+					return
+				}
+
+				// Wait for response from server
+				go func() {
+					msg, err := regStream.Recv()
+					if err != nil {
+						fyne.Do(func() {
+							dialog.ShowError(fmt.Errorf("Ошибка ответа сервера: %v", err), myWindow)
+						})
+						regConn.Close()
+						regCancel()
+						return
+					}
+
+					fyne.Do(func() {
+						regCancel()
+						switch msg.Text {
+						case "REGISTRATION_SUCCESS":
+							dialog.ShowInformation("Успех", fmt.Sprintf("Пользователь %s зарегистрирован! Входим...", u), myWindow)
+							if globalCfg != nil {
+								globalCfg.LastUsername = u
+								globalCfg.LastPassword = p
+								if email != "" {
+									globalCfg.LastEmail = email
+								}
+								_ = saveConfig(globalCfg)
+							}
+							// Set credentials and auto-login
+							currentUsername = u
+							currentPassword = p
+							regConn.Close()
+							// Use the same flow as normal login
+							// Connect to server
+							regConn2, err := grpc.NewClient(selectedServer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+							if err != nil {
+								dialog.ShowError(fmt.Errorf("Ошибка подключения: %v", err), myWindow)
+								return
+							}
+							currentConn = regConn2
+							client := gen.NewChatServiceClient(currentConn)
+
+							// Load avatar
+							go func() {
+								avatarURL, err := getUserAvatar(client, u)
+								if err == nil && avatarURL != "" {
+									avatarCacheMutex.Lock()
+									avatarCache[u] = avatarURL
+									avatarCacheMutex.Unlock()
+								}
+							}()
+
+							// Get chats and connect
+							chats, err := getChats(client, u)
+							if err != nil {
+								connectToServer("general")
+								return
+							}
+							if len(chats) == 0 {
+								connectToServer("general")
+							} else {
+								showChatList(chats, connectToServer)
+							}
+						case "USER_ALREADY_EXISTS":
+							dialog.ShowError(errors.New("Пользователь с таким именем уже существует"), myWindow)
+						case "EMAIL_ALREADY_IN_USE":
+							dialog.ShowError(errors.New("Этот email уже используется"), myWindow)
+						default:
+							dialog.ShowError(fmt.Errorf("Ошибка регистрации: %s", msg.Text), myWindow)
+						}
+					})
+				}()
+			}
+		}, myWindow)
+
+	registerForm.Show()
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
 		cfg = &Config{}
 	}
+	globalCfg = cfg
 
 	// Читаем адрес сервера из конфига, с фоллбэком на localhost
 	serverAddress := cfg.ServerAddress
 	if serverAddress == "" {
-		serverAddress = "localhost:50051"
+		serverAddress = "13.140.25.249:50051"
 	}
+
+	// Fetch server list from GetServers RPC (async, with fallback)
+	go fetchServers(serverAddress)
 
 	isDarkTheme := cfg.CurrentTheme == "dark"
 	activeThemeConfig := cfg.Themes.Light
@@ -548,11 +795,8 @@ func main() {
 	myWindow = myApp.NewWindow(fmt.Sprintf("Lavender Messenger v%s", clientVersion))
 	myWindow.Resize(fyne.NewSize(1200, 800))
 
-	var username string
-	var password string
 	var currentRoomId string
 	var stream gen.ChatService_ChatClient
-	var conn *grpc.ClientConn
 
 	// UI для статуса (индикатор и текст)
 	statusIndicator := canvas.NewCircle(color.RGBA{R: 255, G: 255, B: 0, A: 255}) // Желтый
@@ -604,6 +848,26 @@ func main() {
 	}
 
 	chatBox = widget.NewRichText()
+
+	// Copy button for chat
+	copyChatBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func() {
+		// Collect all text from chat segments
+		var sb strings.Builder
+		for _, seg := range chatBox.Segments {
+			if ts, ok := seg.(*widget.TextSegment); ok {
+				sb.WriteString(ts.Text)
+			}
+		}
+		text := sb.String()
+		if text != "" {
+			cb := myWindow.Clipboard()
+			if cb != nil {
+				cb.SetContent(text)
+			}
+		}
+	})
+	copyChatBtn.Importance = widget.LowImportance
+
 	scrollContainer := container.NewVScroll(chatBox)
 
 	inputBox := widget.NewEntry()
@@ -632,9 +896,9 @@ func main() {
 	// Chat list button
 	chatListBtn := widget.NewButtonWithIcon("Чаты", theme.ListIcon(), func() {
 		// Show chat list
-		if conn != nil {
-			client := gen.NewChatServiceClient(conn)
-			chats, err := getChats(client, username)
+		if currentConn != nil {
+			client := gen.NewChatServiceClient(currentConn)
+			chats, err := getChats(client, currentUsername)
 			if err != nil {
 				dialog.ShowError(err, myWindow)
 				return
@@ -648,15 +912,15 @@ func main() {
 	// Users list button (all users with online status)
 	usersBtn := widget.NewButtonWithIcon("Пользователи", theme.AccountIcon(), func() {
 		// Show all users list with online status
-		if conn != nil {
-			client := gen.NewChatServiceClient(conn)
-			showUsersList(client, username)
+		if currentConn != nil {
+			client := gen.NewChatServiceClient(currentConn)
+			showUsersList(client, currentUsername)
 		} else {
 			dialog.ShowError(errors.New("Сначала подключитесь к серверу"), myWindow)
 		}
 	})
 
-	rightButtons := container.NewHBox(chatListBtn, usersBtn, themeBtn)
+	rightButtons := container.NewHBox(chatListBtn, usersBtn, copyChatBtn, themeBtn)
 	topBar := container.NewBorder(nil, nil, statusBox, rightButtons)
 
 	appendMessage := func(timeStr, user, text string, msgID string, repliedToUser, repliedToText string, reactions []*gen.Reaction) {
@@ -691,13 +955,13 @@ func main() {
 		needsLoad := avatarCache[user] == ""
 		avatarCacheMutex.Unlock()
 
-		if needsLoad && conn != nil {
-			go func(username string) {
-				client := gen.NewChatServiceClient(conn)
-				avatarURL, err := getUserAvatar(client, username)
+		if needsLoad && currentConn != nil {
+			go func(currentUsername string) {
+				client := gen.NewChatServiceClient(currentConn)
+				avatarURL, err := getUserAvatar(client, currentUsername)
 				if err == nil && avatarURL != "" {
 					avatarCacheMutex.Lock()
-					avatarCache[username] = avatarURL
+					avatarCache[currentUsername] = avatarURL
 					avatarCacheMutex.Unlock()
 				}
 			}(user)
@@ -756,7 +1020,7 @@ func main() {
 		if text == "" || stream == nil {
 			return
 		}
-		err := stream.Send(&gen.Message{User: username, Text: text, RoomId: currentRoomId})
+		err := stream.Send(&gen.Message{User: currentUsername, Text: text, RoomId: currentRoomId})
 		if err != nil {
 			safeAppendSystemMessage(fmt.Sprintf("[Ошибка отправки]: %v", err))
 		}
@@ -802,16 +1066,16 @@ func main() {
 		passwordEntry.SetText(cfg.LastPassword)
 	}
 
-	var loginForm *dialog.ConfirmDialog
+	// loginForm is declared globally above, assign to it directly
 
 	connectToServer = func(roomId string) {
 		var err error
-		conn, err = grpc.NewClient(serverAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		currentConn, err = grpc.NewClient(serverAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			dialog.ShowError(err, myWindow)
 			return
 		}
-		client := gen.NewChatServiceClient(conn)
+		client := gen.NewChatServiceClient(currentConn)
 		stream, err = client.Chat(context.Background())
 		if err != nil {
 			dialog.ShowError(err, myWindow)
@@ -828,14 +1092,14 @@ func main() {
 			safeAppendSystemMessage(fmt.Sprintf("[Ошибка загрузки истории]: %v", err))
 		}
 
-		// Send auth/join message with password and roomId
-		joinMessage := fmt.Sprintf("%s присоединился", username)
-		err = stream.Send(&gen.Message{User: username, Text: joinMessage, Password: password, RoomId: roomId})
+		// Send auth/join message with currentPassword and roomId
+		joinMessage := fmt.Sprintf("%s присоединился", currentUsername)
+		err = stream.Send(&gen.Message{User: currentUsername, Text: joinMessage, Password: currentPassword, RoomId: roomId})
 		if err != nil {
 			safeAppendSystemMessage(fmt.Sprintf("[Ошибка отправки]: %v", err))
 		}
 
-		statusLabel.SetText(fmt.Sprintf("Подключено к %s | %s", serverAddress, username))
+		statusLabel.SetText(fmt.Sprintf("Подключено к %s | %s", serverAddress, currentUsername))
 		statusIndicator.FillColor = color.RGBA{R: 0, G: 255, B: 0, A: 255} // Зеленый
 		statusIndicator.Refresh()
 
@@ -855,8 +1119,30 @@ func main() {
 				if err != nil {
 					return // Выход из горутины при любой ошибке
 				}
-				t := in.CreatedAt.AsTime().Local()
-				timeStr := t.Format("15:04:05")
+
+				// Handle SYSTEM messages
+				if in.User == "SYSTEM" {
+					fyne.Do(func() {
+						safeAppendSystemMessage(fmt.Sprintf("[SYSTEM]: %s", in.Text))
+					})
+					continue
+				}
+
+				// Skip join/leave messages
+				if strings.HasSuffix(in.Text, " joined") || strings.HasSuffix(in.Text, " присоединился") ||
+					strings.HasSuffix(in.Text, " left") || strings.HasSuffix(in.Text, " покинул") {
+					continue
+				}
+
+				// Safe timestamp handling
+				var timeStr string
+				if in.CreatedAt != nil {
+					t := in.CreatedAt.AsTime().Local()
+					timeStr = t.Format("15:04:05")
+				} else {
+					timeStr = "00:00:00"
+				}
+
 				fyne.Do(func() {
 					appendMessage(timeStr, in.User, in.Text, in.Id, in.RepliedToUser, in.RepliedToText, in.Reactions)
 				})
@@ -864,55 +1150,105 @@ func main() {
 		}()
 	}
 
+	// Server selector for login — use serverList from GetServers RPC
+	// Wait a moment for fetchServers to populate, fallback if empty
+	time.Sleep(200 * time.Millisecond)
+	if len(serverList) == 0 {
+		serverList = []ServerEntry{
+			{Name: "Новый", Address: "13.140.25.249:50051"},
+			{Name: "Старый", Address: "159.195.38.145:50051"},
+		}
+	}
+	serverNames := make([]string, len(serverList))
+	serverAddrs := make([]string, len(serverList))
+	for i, s := range serverList {
+		serverNames[i] = s.Name
+		serverAddrs[i] = s.Address
+	}
+
+	loginServerSelect := widget.NewSelect(serverNames, func(s string) {})
+	// Pre-select current server
+	loginServerFound := false
+	for i, addr := range serverAddrs {
+		if addr == serverAddress {
+			loginServerSelect.SetSelected(serverNames[i])
+			loginServerFound = true
+			break
+		}
+	}
+	if !loginServerFound && len(serverNames) > 0 {
+		loginServerSelect.SetSelected(serverNames[0])
+	}
+
 	loginForm = dialog.NewCustomConfirm("Вход в чат", "Войти", "Отмена",
 		container.NewVBox(
+			widget.NewLabel("Сервер:"),
+			loginServerSelect,
 			widget.NewLabel("Имя пользователя:"),
 			usernameEntry,
 			widget.NewLabel("Пароль:"),
 			passwordEntry,
+			widget.NewLabel(""),
+			widget.NewButton("Нет аккаунта? Зарегистрироваться", func() {
+				// Find address from selected name
+				selectedAddr := serverAddress
+				for i, name := range serverNames {
+					if name == loginServerSelect.Selected {
+						selectedAddr = serverAddrs[i]
+						break
+					}
+				}
+				loginForm.Hide()
+				showRegisterDialog(selectedAddr)
+			}),
 		),
 		func(b bool) {
 			if b && usernameEntry.Text != "" {
-				username = usernameEntry.Text
-				password = passwordEntry.Text
-				cfg.LastUsername = username
-				cfg.LastPassword = password
+				loginForm.Hide()
+				currentUsername = usernameEntry.Text
+				currentPassword = passwordEntry.Text
+				// Update server address from selector
+				for i, name := range serverNames {
+					if name == loginServerSelect.Selected {
+						serverAddress = serverAddrs[i]
+						break
+					}
+				}
+				cfg.LastUsername = currentUsername
+				cfg.LastPassword = currentPassword
 				_ = saveConfig(cfg)
 
 				// Connect to server first
 				var err error
-				conn, err = grpc.NewClient(serverAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+				currentConn, err = grpc.NewClient(serverAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 				if err != nil {
 					dialog.ShowError(err, myWindow)
 					myApp.Quit()
 					return
 				}
-				client := gen.NewChatServiceClient(conn)
+				client := gen.NewChatServiceClient(currentConn)
 
 				// Load current user avatar
 				go func() {
-					avatarURL, err := getUserAvatar(client, username)
+					avatarURL, err := getUserAvatar(client, currentUsername)
 					if err == nil && avatarURL != "" {
 						avatarCacheMutex.Lock()
-						avatarCache[username] = avatarURL
+						avatarCache[currentUsername] = avatarURL
 						avatarCacheMutex.Unlock()
 					}
 				}()
 
 				// Get chats
-				chats, err := getChats(client, username)
+				chats, err := getChats(client, currentUsername)
 				if err != nil {
 					dialog.ShowError(fmt.Errorf("Ошибка получения чатов: %v", err), myWindow)
-					// If error, just connect to general
 					connectToServer("general")
 					return
 				}
 
 				if len(chats) == 0 {
-					// No chats, connect to general
 					connectToServer("general")
 				} else {
-					// Show chat list
 					showChatList(chats, connectToServer)
 				}
 			} else {
@@ -933,19 +1269,19 @@ func main() {
 				inputBox.Disable()
 				sendBtn.Disable()
 				emojiBtn.Disable()
-				dialog.ShowError(fmt.Errorf("Не удалось подключиться к серверу.\nПожалуйста, убедитесь, что он запущен."), myWindow)
 			} else {
 				statusLabel.SetText("Ожидание входа...")
 				statusIndicator.FillColor = color.RGBA{R: 255, G: 255, B: 0, A: 255} // Желтый
 				statusIndicator.Refresh()
-				loginForm.Show()
 			}
+			// Always show login form so user can try to connect or register
+			loginForm.Show()
 		})
 	}()
 
 	myApp.Run()
 
-	if conn != nil {
-		_ = conn.Close()
+	if currentConn != nil {
+		_ = currentConn.Close()
 	}
 }

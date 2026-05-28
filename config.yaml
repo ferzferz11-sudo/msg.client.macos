@@ -1,4 +1,4 @@
-server_address: 159.195.38.145:50051
+server_address: 13.140.25.249:50051
 themes:
     light:
         bg_color: '#FFFFFF'
@@ -33,5 +33,6 @@ themes:
             - '#FFCC80'
             - '#FFAB91'
 current_theme: dark
-last_username: MacOsTester
-last_password: "123"
+last_username: test22
+last_password: "11"
+last_email: ""
